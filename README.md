@@ -4,6 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-live%20in%20production-2F7D5C" alt="Status">
+  <img src="https://img.shields.io/badge/tests-60%20passing-2F7D5C" alt="Tests passing">
   <img src="https://img.shields.io/badge/reviewer%20flaws-9%2F9%20closed-2F7D5C" alt="Reviewer flaws closed">
   <img src="https://img.shields.io/badge/Google%20Cloud-ADK%20%7C%20Vertex%20AI%20%7C%20BigQuery-524499" alt="Google Cloud stack">
   <img src="https://img.shields.io/badge/databases-Oracle%20%7C%20AlloyDB%20%7C%20MySQL-9C3D5B" alt="Databases">
@@ -167,6 +168,7 @@ This repo holds two runnable versions of NEXORA:
 pip install -r requirements.txt
 python demo.py              # runs narrated end-to-end scenarios against local simulators
 pytest test_safety.py -v    # the safety gate — same suite cloudbuild.yaml runs in CI
+                             # → 17 passed (real, last verified 2026-09-07 — see VERIFICATION.md)
 ```
 
 ## See the live deployment
@@ -179,6 +181,20 @@ The dashboard lets you switch between engines, watch the live per-tick
 Agent Execution Loop, trigger a staged failure and watch Tier 1/2 auto-fix
 it, or trigger a Tier 3 scenario and see the Slack approval card and
 900-second countdown for yourself.
+
+## Verification & reproducibility
+
+Every specific number in this repo's documentation — test counts, the 9/9
+reviewer-flaw closures, the live `/compliance` figures — is backed by a
+command you can run yourself, not asserted from memory:
+
+- **[`VERIFICATION.md`](VERIFICATION.md)** — the real, current test pass
+  counts (60/60, 0 failing, last run 2026-09-07) and the real `curl`
+  commands + responses used to check the live system's state.
+- **[`REPRODUCE.md`](REPRODUCE.md)** — three independent ways to see
+  NEXORA work yourself: the live system directly, the local zero-dependency
+  reference implementation, or the production orchestrator's own test
+  suite — none of which require a GCP project of your own.
 
 ## Security notes
 
