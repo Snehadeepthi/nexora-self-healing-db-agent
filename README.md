@@ -165,7 +165,7 @@ This repo holds two runnable versions of NEXORA:
 | `gcp_deploy/` | **The production system** — everything currently live on GCP. `services/orchestrator/` is the Cloud Run service (agent, pipeline, guardrails, dashboard); `terraform/` is the infrastructure as code for every resource above; `tools_db/` holds the MCP Toolbox configs (`tools_cloudrun.yaml` is a safe placeholder template — real values are injected at deploy time, never committed); `demo_triggers/` are the staged-failure scripts behind the dashboard's demo buttons. |
 | `adk_agent/` | A local ADK dev harness that mirrors the Cloud Run service, for iterating on agent logic without a full cloud deploy. |
 | `*.py` (repo root) + `simulators/` | The original **zero-dependency local reference implementation** — the Sense→Predict→Reason→Act→Learn pipeline running entirely against local simulators, no GCP project or credentials required. Useful for understanding the reasoning loop in isolation. See **Quick start (local)** below. |
-| `apply_*.py` | Incremental patch scripts documenting the hardening history of the orchestrator (each corresponds to a specific fix — TTL handling, connection thresholds, the Toolbox split, etc.). |
+| `scripts/migrations/apply_*.py` | Incremental patch scripts documenting the hardening history of the orchestrator (each corresponds to a specific fix — TTL handling, connection thresholds, the Toolbox split, etc.). Kept as a historical record — see `README_HARDENING_PATCHES.md` for the narrative. |
 
 ## Quick start (local, no GCP required)
 
