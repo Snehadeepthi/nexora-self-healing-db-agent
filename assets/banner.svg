@@ -1,0 +1,20 @@
+<svg width="1200" height="260" viewBox="0 0 1200 260" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#16302B"/>
+      <stop offset="100%" stop-color="#3d2f66"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="260" fill="url(#bg)"/>
+  <text x="60" y="120" font-family="Arial, Helvetica, sans-serif" font-size="64" font-weight="800" fill="#F4F9F7" letter-spacing="2">NEXORA</text>
+  <text x="62" y="158" font-family="Arial, Helvetica, sans-serif" font-size="20" fill="#C7D9D3">Self-Healing Database Agent · Sense &#8594; Predict &#8594; Reason+Act &#8594; Learn</text>
+  <rect x="62" y="190" width="90" height="30" rx="15" fill="#2F7D5C"/>
+  <text x="107" y="210" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="600" fill="#F4F9F7" text-anchor="middle">Oracle</text>
+  <rect x="162" y="190" width="100" height="30" rx="15" fill="#524499"/>
+  <text x="212" y="210" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="600" fill="#F4F9F7" text-anchor="middle">AlloyDB</text>
+  <rect x="272" y="190" width="90" height="30" rx="15" fill="#9C3D5B"/>
+  <text x="317" y="210" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="600" fill="#F4F9F7" text-anchor="middle">MySQL</text>
+  <text x="1140" y="60" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#C7D9D3" text-anchor="end">Google Cloud · Vertex AI · ADK</text>
+  <text x="1140" y="110" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="end"><tspan fill="#3FBE85">&#9679; </tspan><tspan fill="#F4F9F7" font-weight="700">Live in Production</tspan></text>
+  <text x="1140" y="135" font-family="Arial, Helvetica, sans-serif" font-size="13" fill="#C7D9D3" text-anchor="end">9/9 Reviewer Flaws Closed — Verified 2026-09-02</text>
+</svg>
