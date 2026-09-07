@@ -1,0 +1,63 @@
+# Run from the PROJECT ROOT (the folder containing config.py, test_safety.py,
+# etc.) with:  gcloud builds submit --config=gcp_deploy/cloudbuild.yaml
+#
+# The CI safety gate. This runs gcp_deploy/services/orchestrator's OWN
+# test_safety.py -- the ADK + MCP Toolbox rebuild's guardrail tests --
+# against the exact directory that gets containerized and deployed below,
+# not the root-level reference implementation's test suite. (The root
+# test_safety.py still exists and still passes -- it validates the
+# original, non-ADK reference implementation, left in place unmodified --
+# but it no longer describes what this pipeline actually ships, so the gate
+# that blocks a deploy has to be the one that does.) A single failing
+# guardrail test here blocks the image from ever being built, let alone
+# deployed.
+
+substitutions:
+  _REGION: us-central1
+
+steps:
+  - id: safety-gate
+    name: 'python:3.11-slim'
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        cd gcp_deploy/services/orchestrator
+        pip install -r requirements.txt pytest --quiet
+        pytest test_safety.py -v
+
+  - id: build-image
+    name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/self-healing-agent/orchestrator:$BUILD_ID'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/self-healing-agent/orchestrator:latest'
+      - 'gcp_deploy/services/orchestrator'
+    waitFor: ['safety-gate']
+
+  - id: push-image
+    name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '--all-tags', '${_REGION}-docker.pkg.dev/$PROJECT_ID/self-healing-agent/orchestrator']
+    waitFor: ['build-image']
+
+  - id: deploy-image
+    name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - run
+      - services
+      - update
+      - self-healing-orchestrator
+      - '--image=${_REGION}-docker.pkg.dev/$PROJECT_ID/self-healing-agent/orchestrator:$BUILD_ID'
+      - '--region=${_REGION}'
+    waitFor: ['push-image']
+
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/self-healing-agent/orchestrator:$BUILD_ID'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/self-healing-agent/orchestrator:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

@@ -1,0 +1,34 @@
+[
+  {
+    "id": "rb-03",
+    "title": "AlloyDB blocking session",
+    "tier": "Tier 1",
+    "action_key": "alloydb_kill_blocking_session",
+    "match_key": "blocking_session pg_locks lock_wait blocking backend pg_stat_activity",
+    "body": "A Postgres backend is confirmed holding a lock that is blocking other sessions, identified via pg_stat_activity / pg_locks (alloydb_find_blocking_session). Terminate exactly that backend -- SELECT pg_terminate_backend(pid) -- using the pid returned by the lookup, never a guessed value, to release everything waiting behind it."
+  },
+  {
+    "id": "rb-04",
+    "title": "AlloyDB runaway query",
+    "tier": "Tier 1",
+    "action_key": "alloydb_kill_runaway_query",
+    "match_key": "runaway_query long_running query_duration high cpu backend",
+    "body": "A single query has been running far longer than expected, consuming excessive CPU/IO on its backend. Terminate that backend directly -- SELECT pg_terminate_backend(pid) -- same underlying mechanism as alloydb_kill_blocking_session, kept as a separate allowlisted action so it is audited and reasoned about under its own name."
+  },
+  {
+    "id": "rb-05",
+    "title": "AlloyDB idle-in-transaction buildup",
+    "tier": "Tier 2",
+    "action_key": "alloydb_terminate_idle_in_transaction",
+    "match_key": "AlloyDB connections stuck idle-in-transaction",
+    "body": "Backends have been sitting idle-in-transaction past a safe threshold (300s in the reference config), holding locks and connection slots for no active work. Batch-terminate every matching backend -- SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state = 'idle in transaction' AND state_change < now() - interval '{idle_seconds} seconds'. Auto-executes at Tier 2: allowed without human approval, but every run is logged loudly to the audit trail -- can affect multiple sessions at once, broader blast radius than a Tier 1 single-backend kill."
+  },
+  {
+    "id": "rb-06",
+    "title": "AlloyDB connection storm",
+    "tier": "Tier 3",
+    "action_key": "alloydb_reset_all_connections",
+    "match_key": "AlloyDB connection storm -- last-resort reset requested",
+    "body": "Last-resort, instance-wide reset: terminates every other active session on the database -- SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND datname = current_database(). Requires human approval via Slack before it ever runs (Tier 3) -- approving it during a live demo genuinely terminates every other session, so only approve this in a controlled setting."
+  }
+]

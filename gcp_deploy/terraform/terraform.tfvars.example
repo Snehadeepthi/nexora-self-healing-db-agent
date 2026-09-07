@@ -1,0 +1,22 @@
+# Copy this file to terraform.tfvars and fill in your own values.
+# terraform.tfvars is where your real values live -- keep it out of git
+# (a .gitignore entry for it is already in this folder).
+
+project_id = "CHANGE_ME"
+region = "CHANGE_ME"
+zone = "CHANGE_ME"
+
+# Pick a real password -- this becomes both the Oracle DB password and the
+# value stored in Secret Manager.
+oracle_db_password = "CHANGE_ME"
+
+# Optional but recommended: Slack Incoming Webhook URL so Tier 3 approval
+# requests and status reports actually go somewhere. Create one at
+# https://api.slack.com/messaging/webhooks -- leave blank to deploy with a
+# placeholder and fill in Secret Manager later.
+notify_slack_webhook_url = "CHANGE_ME"
+
+gemini_model = "CHANGE_ME"
+mysql_password = "CHANGE_ME"
+alloydb_password = "CHANGE_ME"
+demo_trigger_secret = "CHANGE_ME"

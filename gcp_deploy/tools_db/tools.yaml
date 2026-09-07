@@ -1,0 +1,773 @@
+# MCP Toolbox for Databases -- tool definitions for the self-healing agent.
+#
+# This file is the single source of truth for every SQL statement the agent
+# can ever run against Oracle. It is a direct, 1:1 translation of
+# config.ALLOWLIST (see ../config.py, copied unchanged from the original
+# reference implementation) into Toolbox's tool format -- same action names,
+# same tiers (documented in each tool's description so the model sees them),
+# same statement templates, same param schemas. config.py stays the single
+# source of truth for TIERING and SIGNOFF enforcement (that happens in
+# ../guardrail_callbacks.py, in our own process, not in Toolbox); this file
+# is only responsible for *how the SQL actually runs*.
+#
+# One deliberate omission: restart_listener. It's an OS-level `lsnrctl
+# restart`, not SQL -- Toolbox is a SQL/database tool server and has no path
+# to a host shell. It stays a local ADK FunctionTool in ../db_tools.py that
+# fails loudly with the same honest error the reference GCP deployment's
+# oracle_client.py already documents, rather than being faked here.
+#
+# ALTER SYSTEM statements don't accept Oracle bind variables the way normal
+# DML does, so the dynamic values below use Toolbox's `templateParameters`
+# (textual substitution into the statement, Go-template `{{.name}}` syntax)
+# rather than `parameters` (driver-bound placeholders) -- the same reason
+# the original reference implementation builds these with Python `.format()`
+# instead of a parameterized driver call. See act.py's docstring for the
+# same tradeoff stated in the original codebase.
+
+kind: source
+name: oracle-db
+type: oracle
+host: ${ORACLE_HOST}
+port: ${ORACLE_PORT}
+serviceName: ${ORACLE_SERVICE}
+user: ${ORACLE_USER}
+password: ${ORACLE_PASSWORD}
+
+---
+# --- Read tools (Sense stage -- called directly via toolbox-core, no LLM) ---
+
+kind: tool
+name: poll_telemetry
+type: oracle-sql
+source: oracle-db
+readOnly: true
+description: >
+  Sense-stage poll: current count of sessions blocked by another session's
+  lock, and the latest host CPU utilization reading. No parameters.
+statement: |
+  SELECT
+    (SELECT COUNT(*) FROM v$session WHERE blocking_session IS NOT NULL) AS active_blocked_sessions,
+    (SELECT NVL(ROUND(value), 0) FROM v$sysmetric
+      WHERE metric_name = 'Host CPU Utilization (%)'
+      ORDER BY begin_time DESC FETCH FIRST 1 ROW ONLY) AS cpu_utilization_pct
+  FROM dual
+
+---
+kind: tool
+name: describe_state
+type: oracle-sql
+source: oracle-db
+readOnly: true
+description: >
+  Act-stage pre-action snapshot: same blocked-session count as
+  poll_telemetry, taken immediately before a remediation statement runs, so
+  every action_executed audit entry carries a pre-state snapshot (Risk 1:
+  wrong-diagnosis blast radius).
+statement: |
+  SELECT COUNT(*) AS active_blocked_sessions_snapshot FROM v$session
+  WHERE blocking_session IS NOT NULL
+
+---
+kind: tool
+name: describe_database
+type: oracle-sql
+source: oracle-db
+readOnly: true
+description: >
+  Dashboard-only info lookup: the real instance name, current container
+  (PDB) name, and Oracle version banner -- not hardcoded in the dashboard,
+  so it reflects whatever's actually running. Needs V_$INSTANCE/V_$VERSION
+  grants (see database.tf's grant_v_views.sql). No parameters.
+statement: |
+  SELECT
+    (SELECT instance_name FROM v$instance) AS db_name,
+    sys_context('userenv','con_name') AS pdb_name,
+    (SELECT version FROM v$instance) AS version_short,
+    (SELECT banner FROM v$version WHERE banner LIKE '%Database%' FETCH FIRST 1 ROW ONLY) AS version_banner
+  FROM dual
+
+---
+kind: tool
+name: statspack_window
+type: oracle-sql
+source: oracle-db
+readOnly: true
+description: >
+  Statspack dashboard panel: the two most recent Statspack snapshot IDs
+  (perfstat.stats$snapshot), used as the window for statspack_summary and
+  statspack_top_waits. No parameters.
+statement: |
+  SELECT
+    MIN(snap_id) AS begin_snap,
+    MAX(snap_id) AS end_snap
+  FROM (
+    SELECT snap_id FROM perfstat.stats$snapshot
+    ORDER BY snap_id DESC FETCH FIRST 2 ROWS ONLY
+  )
+
+---
+kind: tool
+name: statspack_summary
+type: oracle-sql
+source: oracle-db
+readOnly: true
+description: >
+  Statspack dashboard panel: core instance-efficiency ratios (buffer cache
+  hit %, library cache hit %) and load-profile rates (redo/sec, logical
+  reads/sec, physical reads/sec, executes/sec) computed as the delta
+  between two Statspack snapshots. Query verified manually against live
+  snap 11->12 data (Buffer Cache Hit 99.9%, Library Cache Hit 96.3%, Redo
+  3.19 KB/s, Logical Reads 15.9/s, Physical Reads 0.02/s, Executes 2.47/s)
+  before being wired in here.
+parameters:
+  - name: begin_snap
+    type: integer
+    description: The earlier Statspack snap_id (perfstat.stats$snapshot).
+  - name: end_snap
+    type: integer
+    description: The later Statspack snap_id (perfstat.stats$snapshot).
+statement: |
+  WITH deltas AS (
+    SELECT e.name, e.value - b.value AS delta
+    FROM perfstat.stats$sysstat b
+    JOIN perfstat.stats$sysstat e ON e.name = b.name
+    WHERE b.snap_id = :begin_snap AND e.snap_id = :end_snap
+  ),
+  elapsed AS (
+    SELECT (e.snap_time - b.snap_time) * 86400 AS secs
+    FROM perfstat.stats$snapshot b, perfstat.stats$snapshot e
+    WHERE b.snap_id = :begin_snap AND e.snap_id = :end_snap
+  ),
+  agg AS (
+    SELECT
+      MAX(CASE WHEN name = 'physical reads' THEN delta END) AS phys_reads,
+      MAX(CASE WHEN name = 'db block gets' THEN delta END) AS db_block_gets,
+      MAX(CASE WHEN name = 'consistent gets' THEN delta END) AS consistent_gets,
+      MAX(CASE WHEN name = 'redo size' THEN delta END) AS redo_size,
+      MAX(CASE WHEN name = 'execute count' THEN delta END) AS execute_count
+    FROM deltas
+  ),
+  lib AS (
+    SELECT ROUND(SUM(e.pinhits - b.pinhits) / NULLIF(SUM(e.pins - b.pins), 0) * 100, 2) AS library_cache_hit_pct
+    FROM perfstat.stats$librarycache b, perfstat.stats$librarycache e
+    WHERE b.snap_id = :begin_snap AND e.snap_id = :end_snap
+      AND b.namespace = e.namespace
+  )
+  SELECT
+    ROUND((1 - agg.phys_reads / NULLIF(agg.db_block_gets + agg.consistent_gets, 0)) * 100, 2) AS buffer_cache_hit_pct,
+    lib.library_cache_hit_pct AS library_cache_hit_pct,
+    ROUND(agg.redo_size / NULLIF(elapsed.secs, 0) / 1024, 2) AS redo_per_sec_kb,
+    ROUND((agg.db_block_gets + agg.consistent_gets) / NULLIF(elapsed.secs, 0), 1) AS logical_reads_per_sec,
+    ROUND(agg.phys_reads / NULLIF(elapsed.secs, 0), 2) AS physical_reads_per_sec,
+    ROUND(agg.execute_count / NULLIF(elapsed.secs, 0), 2) AS executes_per_sec,
+    ROUND(elapsed.secs / 60, 1) AS elapsed_minutes
+  FROM agg, elapsed, lib
+
+---
+kind: tool
+name: statspack_top_waits
+type: oracle-sql
+source: oracle-db
+readOnly: true
+description: >
+  Statspack dashboard panel: top 5 wait events by time waited between two
+  Statspack snapshots, excluding common idle events.
+parameters:
+  - name: begin_snap
+    type: integer
+    description: The earlier Statspack snap_id (perfstat.stats$snapshot).
+  - name: end_snap
+    type: integer
+    description: The later Statspack snap_id (perfstat.stats$snapshot).
+statement: |
+  SELECT
+    e.event AS event,
+    e.total_waits - b.total_waits AS waits,
+    ROUND((e.time_waited_micro - b.time_waited_micro) / 1000000, 1) AS time_waited_sec
+  FROM perfstat.stats$system_event b, perfstat.stats$system_event e
+  WHERE b.snap_id = :begin_snap AND e.snap_id = :end_snap
+    AND b.event = e.event
+    AND e.event NOT IN (
+      'SQL*Net message from client','rdbms ipc message','smon timer','pmon timer',
+      'jobq slave wait','class slave wait','PL/SQL lock timer',
+      'wait for unread message on broadcast channel'
+    )
+    AND (e.time_waited_micro - b.time_waited_micro) > 0
+  ORDER BY (e.time_waited_micro - b.time_waited_micro) DESC
+  FETCH FIRST 5 ROWS ONLY
+
+---
+kind: tool
+name: find_blocking_session
+type: oracle-sql
+source: oracle-db
+readOnly: true
+description: >
+  Sense/Reason-stage lookup: the real SID and SERIAL# of the session
+  currently HOLDING a blocking lock (not the sessions waiting on it) --
+  grounds kill_blocking_session's required params in a real fact instead of
+  leaving the model to guess them, which would either fail loudly
+  (ORA-00030 on a made-up sid) or, worse, risk hitting an unrelated real
+  session that happens to share a guessed sid. No parameters.
+statement: |
+  SELECT
+    bs.sid AS blocking_sid,
+    bs.serial# AS blocking_serial
+  FROM v$session bs
+  WHERE bs.sid = (
+    SELECT blocking_session FROM v$session
+    WHERE blocking_session IS NOT NULL
+    FETCH FIRST 1 ROW ONLY
+  )
+
+---
+# --- Remediation tools (Reason+Act stage -- LLM-callable, one per
+#     config.ALLOWLIST entry, guarded by guardrail_callbacks.py) ---
+
+kind: tool
+name: kill_blocking_session
+type: oracle-sql
+source: oracle-db
+description: >
+  Tier 1 (auto-executes). Terminate a single session holding a blocking
+  lock. Use when active_blocked_sessions is sustained_high and the nearest
+  runbook points at lock contention.
+templateParameters:
+  - name: sid
+    type: integer
+    description: The blocking session's SID (v$session.sid).
+  - name: serial
+    type: integer
+    description: The blocking session's SERIAL# (v$session.serial#), paired with sid.
+statement: |
+  ALTER SYSTEM KILL SESSION '{{.sid}},{{.serial}}' IMMEDIATE
+
+---
+kind: tool
+name: kill_runaway_query
+type: oracle-sql
+source: oracle-db
+description: >
+  Tier 1 (auto-executes). Terminate a single runaway/long-running query
+  session. Same mechanism as kill_blocking_session, kept as a distinct
+  allowlisted action so the audit trail records the operator's actual
+  diagnosis (lock contention vs. a runaway query), not just the SQL that ran.
+templateParameters:
+  - name: sid
+    type: integer
+    description: The runaway session's SID (v$session.sid).
+  - name: serial
+    type: integer
+    description: The runaway session's SERIAL# (v$session.serial#), paired with sid.
+statement: |
+  ALTER SYSTEM KILL SESSION '{{.sid}},{{.serial}}' IMMEDIATE
+
+---
+kind: tool
+name: flush_shared_pool
+type: oracle-sql
+source: oracle-db
+description: >
+  Tier 2 (auto-executes, logged loudly + paged). Flush the shared pool to
+  relieve library cache contention. No parameters.
+statement: |
+  ALTER SYSTEM FLUSH SHARED_POOL
+
+---
+kind: tool
+name: increase_pga_target
+type: oracle-sql
+source: oracle-db
+description: >
+  Tier 3 (requires human approval -- instance-wide change). Raise
+  PGA_AGGREGATE_TARGET by one step to relieve memory pressure.
+templateParameters:
+  - name: target_mb
+    type: integer
+    description: New PGA_AGGREGATE_TARGET value, in megabytes.
+statement: |
+  ALTER SYSTEM SET PGA_AGGREGATE_TARGET = {{.target_mb}}M SCOPE=BOTH
+
+---
+kind: toolset
+name: db_reads
+tools:
+  - poll_telemetry
+  - describe_state
+  - find_blocking_session
+  - describe_database
+  - statspack_window
+  - statspack_summary
+  - statspack_top_waits
+
+---
+kind: toolset
+name: db_remediation
+tools:
+  - kill_blocking_session
+  - kill_runaway_query
+  - flush_shared_pool
+  - increase_pga_target
+
+---
+kind: toolset
+name: db_ops
+tools:
+  - poll_telemetry
+  - describe_state
+  - find_blocking_session
+  - describe_database
+  - statspack_window
+  - statspack_summary
+  - statspack_top_waits
+  - kill_blocking_session
+  - kill_runaway_query
+  - flush_shared_pool
+  - increase_pga_target
+---
+kind: source
+name: alloydb-db
+type: postgres
+host: ${ALLOYDB_HOST}
+port: ${ALLOYDB_PORT}
+database: ${ALLOYDB_DATABASE}
+user: ${ALLOYDB_USER}
+password: ${ALLOYDB_PASSWORD}
+---
+kind: tool
+name: alloydb_poll_telemetry
+type: postgres-sql
+source: alloydb-db
+description: >
+  AlloyDB Sense-stage poll: current count of sessions blocked waiting on a
+  lock. cpu_utilization_pct is a fixed 0 -- unlike Oracle's v$sysmetric,
+  Postgres/AlloyDB has no built-in SQL-queryable CPU metric; the real
+  reading lives in Cloud Monitoring (System Insights), out of scope for a
+  Toolbox SQL tool. No parameters.
+statement: |
+  SELECT
+    (SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock') AS active_blocked_sessions,
+    0 AS cpu_utilization_pct,
+    (SELECT COALESCE(MAX(EXTRACT(EPOCH FROM (now() - query_start))), 0)::int
+       FROM pg_stat_activity
+       WHERE state = 'active' AND pid <> pg_backend_pid()
+         AND backend_type = 'client backend') AS max_query_duration_seconds,
+    (SELECT count(*) FROM pg_stat_activity
+       WHERE state = 'idle in transaction'
+         AND state_change < now() - interval '300 seconds') AS idle_in_transaction_count,
+    (SELECT count(*) FROM pg_stat_activity) AS total_connections,
+    (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_connections
+---
+kind: tool
+name: alloydb_describe_database
+type: postgres-sql
+source: alloydb-db
+description: >
+  Dashboard-only info lookup for AlloyDB: current database name and the
+  PostgreSQL version banner, read live rather than hardcoded. pdb_name is
+  NULL -- pluggable databases are an Oracle concept with no AlloyDB
+  equivalent; db_tools.describe_database() already handles a missing/NULL
+  value for that field. No parameters.
+statement: |
+  SELECT
+    current_database() AS db_name,
+    NULL AS pdb_name,
+    split_part(version(), ' ', 2) AS version_short,
+    version() AS version_banner
+---
+kind: toolset
+name: alloydb_reads
+tools:
+  - alloydb_poll_telemetry
+  - alloydb_describe_database
+  - alloydb_describe_state
+  - alloydb_find_blocking_session
+  - alloydb_find_runaway_query
+---
+kind: tool
+name: alloydb_describe_state
+type: postgres-sql
+source: alloydb-db
+description: >
+  Act-stage pre-action snapshot (Risk 1) for AlloyDB: same blocked-session
+  count as alloydb_poll_telemetry, taken immediately before a remediation
+  statement runs, so every action_executed audit entry carries a pre-state
+  snapshot -- mirrors Oracle's describe_state tool exactly, just against
+  pg_stat_activity instead of v$session. No parameters.
+statement: |
+  SELECT count(*) AS active_blocked_sessions_snapshot
+  FROM pg_stat_activity
+  WHERE wait_event_type = 'Lock'
+---
+kind: tool
+name: alloydb_find_blocking_session
+type: postgres-sql
+source: alloydb-db
+description: >
+  Sense/Reason-stage lookup: the real backend PID holding a lock that's
+  currently blocking another session -- grounds alloydb_kill_blocking_session's
+  required pid param in a real fact instead of leaving the model to guess it.
+  pg_blocking_pids() is the standard Postgres/AlloyDB mechanism for this (no
+  join gymnastics against pg_locks needed). No parameters.
+statement: |
+  SELECT unnest(pg_blocking_pids(pid)) AS blocking_pid
+  FROM pg_stat_activity
+  WHERE cardinality(pg_blocking_pids(pid)) > 0
+  LIMIT 1
+---
+kind: tool
+name: alloydb_find_runaway_query
+type: postgres-sql
+source: alloydb-db
+description: >
+  Sense/Reason-stage lookup: the real backend PID of the longest-running
+  active query -- grounds alloydb_kill_runaway_query's required pid param
+  in a real fact instead of leaving the model to guess it. AlloyDB analog
+  of alloydb_find_blocking_session, see that tool's description for the
+  anti-hallucination rationale. No parameters.
+statement: |
+  SELECT pid AS runaway_pid
+  FROM pg_stat_activity
+  WHERE state = 'active' AND pid <> pg_backend_pid()
+    AND backend_type = 'client backend'
+  ORDER BY query_start ASC
+  LIMIT 1
+---
+# --- AlloyDB remediation tools (Reason+Act stage -- LLM-callable, one per
+#     config.ALLOWLIST entry with engine="alloydb", guarded by
+#     guardrail_callbacks.py exactly like the Oracle actions). Postgres-
+#     idiomatic, not literal Oracle mirrors: AlloyDB has no ALTER SYSTEM
+#     "flush shared pool" equivalent and managed-instance ALTER SYSTEM
+#     support isn't something to assert without live verification, so these
+#     use only pg_terminate_backend, which is guaranteed available. ---
+kind: tool
+name: alloydb_kill_blocking_session
+type: postgres-sql
+source: alloydb-db
+description: >
+  Tier 1 (auto-executes). Terminate a single Postgres backend holding a
+  blocking lock. Use when active_blocked_sessions is sustained_high and the
+  nearest runbook points at lock contention. AlloyDB analog of
+  kill_blocking_session.
+templateParameters:
+  - name: pid
+    type: integer
+    description: The blocking backend's process id (pg_stat_activity.pid).
+statement: |
+  SELECT pg_terminate_backend({{.pid}})
+---
+kind: tool
+name: alloydb_kill_runaway_query
+type: postgres-sql
+source: alloydb-db
+description: >
+  Tier 1 (auto-executes). Terminate a single runaway/long-running query's
+  backend. Same mechanism as alloydb_kill_blocking_session, kept as a
+  distinct allowlisted action so the audit trail records the operator's
+  actual diagnosis, not just the SQL that ran. AlloyDB analog of
+  kill_runaway_query.
+templateParameters:
+  - name: pid
+    type: integer
+    description: The runaway query's backend process id (pg_stat_activity.pid).
+statement: |
+  SELECT pg_terminate_backend({{.pid}})
+---
+kind: tool
+name: alloydb_terminate_idle_in_transaction
+type: postgres-sql
+source: alloydb-db
+description: >
+  Tier 2 (auto-executes, logged loudly + paged). Batch-terminate every
+  backend stuck 'idle in transaction' longer than idle_seconds -- a common
+  real Postgres lock-contention cause with no Oracle equivalent action.
+  Broader blast radius than a single kill (can affect multiple sessions),
+  which is why this is Tier 2 rather than Tier 1.
+templateParameters:
+  - name: idle_seconds
+    type: integer
+    description: Terminate backends idle-in-transaction longer than this many seconds.
+statement: |
+  SELECT pg_terminate_backend(pid)
+  FROM pg_stat_activity
+  WHERE state = 'idle in transaction'
+    AND state_change < now() - interval '{{.idle_seconds}} seconds'
+---
+kind: tool
+name: alloydb_get_statement_timeout
+type: postgres-sql
+source: alloydb-db
+description: >
+  Read-only helper for alloydb_set_statement_timeout's rollback: returns
+  the database's current statement_timeout setting as raw text (e.g. '0'
+  for unlimited, '5000ms'), captured immediately before the action changes
+  it so the exact prior value can be replayed verbatim on rollback (see
+  main.py's /rollback endpoint). No parameters.
+statement: |
+  SELECT current_setting('statement_timeout') AS statement_timeout
+---
+kind: tool
+name: alloydb_set_statement_timeout
+type: postgres-sql
+source: alloydb-db
+description: >
+  Tier 2 (auto-executes, logged loudly + paged). Deterministically
+  triggered right after a successful alloydb_kill_runaway_query -- never
+  LLM-selected -- to prevent the same runaway-query pattern from recurring
+  immediately. Genuinely reversible: the caller captures the exact prior
+  value via alloydb_get_statement_timeout before calling this, and can
+  replay it verbatim through the same tool to undo the change.
+templateParameters:
+  - name: statement_timeout_value
+    type: string
+    description: >
+      The new statement_timeout value to set, e.g. '5000ms'. Also used
+      verbatim (with the prior captured value) to restore the setting on
+      rollback.
+statement: |
+  ALTER DATABASE postgres SET statement_timeout = '{{.statement_timeout_value}}'
+---
+kind: tool
+name: alloydb_reset_all_connections
+type: postgres-sql
+source: alloydb-db
+description: >
+  Tier 3 (requires human approval -- instance-wide change). Terminate every
+  other active session on this database: a last-resort connection-pool
+  reset. AlloyDB analog of increase_pga_target's "instance-wide, needs
+  approval" role, deliberately avoiding ALTER SYSTEM (unverified support on
+  a managed AlloyDB instance) in favor of pg_terminate_backend, which is
+  guaranteed available. No parameters.
+statement: |
+  SELECT pg_terminate_backend(pid)
+  FROM pg_stat_activity
+  WHERE pid <> pg_backend_pid()
+    AND datname = current_database()
+---
+kind: toolset
+name: alloydb_remediation
+tools:
+  - alloydb_kill_blocking_session
+  - alloydb_kill_runaway_query
+  - alloydb_terminate_idle_in_transaction
+  - alloydb_reset_all_connections
+---
+kind: toolset
+name: alloydb_ops
+tools:
+  - alloydb_poll_telemetry
+  - alloydb_describe_database
+  - alloydb_describe_state
+  - alloydb_find_blocking_session
+  - alloydb_kill_blocking_session
+  - alloydb_kill_runaway_query
+  - alloydb_terminate_idle_in_transaction
+  - alloydb_reset_all_connections
+---
+kind: source
+name: mysql-db
+type: mysql
+host: ${MYSQL_HOST}
+port: ${MYSQL_PORT}
+database: ${MYSQL_DATABASE}
+user: ${MYSQL_USER}
+password: ${MYSQL_PASSWORD}
+---
+# --- MySQL (Cloud SQL) read tools (Sense stage) -- InnoDB/performance_schema
+# idiomatic, not literal Postgres/Oracle mirrors. Blocking-session detection
+# uses performance_schema.data_lock_waits (MySQL 8.0+), not the deprecated
+# INFORMATION_SCHEMA.INNODB_LOCK_WAITS. Learned from the AlloyDB WAL-sender
+# false-positive earlier in this project: every query here filters to real
+# client work (COMMAND = 'Query', excluding replication/background
+# threads) rather than trusting an unfiltered processlist scan. ---
+kind: tool
+name: mysql_poll_telemetry
+type: mysql-sql
+source: mysql-db
+description: >
+  MySQL Sense-stage poll: current count of sessions blocked waiting on an
+  InnoDB row lock (performance_schema.data_lock_waits), the longest-running
+  active client query in seconds, current idle-in-transaction connections
+  past a 300s cutoff, and connection usage as a percent of max_connections.
+  cpu_utilization_pct is a fixed 0 -- like AlloyDB, MySQL has no built-in
+  SQL-queryable CPU metric; the real reading lives in Cloud Monitoring, out
+  of scope for this poll. No parameters.
+statement: |
+  SELECT
+    (SELECT COUNT(DISTINCT REQUESTING_THREAD_ID) FROM performance_schema.data_lock_waits) AS active_blocked_sessions,
+    0 AS cpu_utilization_pct,
+    (SELECT COALESCE(MAX(TIME), 0) FROM information_schema.processlist
+       WHERE COMMAND = 'Query' AND ID <> CONNECTION_ID()) AS max_query_duration_seconds,
+    (SELECT COUNT(*)
+       FROM performance_schema.events_transactions_current etc
+       JOIN performance_schema.threads th ON th.THREAD_ID = etc.THREAD_ID
+       WHERE etc.STATE = 'ACTIVE'
+         AND th.PROCESSLIST_COMMAND = 'Sleep'
+         AND th.PROCESSLIST_TIME > 300) AS idle_in_transaction_count,
+    (SELECT COUNT(*) FROM information_schema.processlist) AS total_connections,
+    (SELECT CAST(VARIABLE_VALUE AS UNSIGNED) FROM performance_schema.global_variables
+       WHERE VARIABLE_NAME = 'max_connections') AS max_connections
+---
+kind: tool
+name: mysql_describe_database
+type: mysql-sql
+source: mysql-db
+description: >
+  Dashboard-only info lookup for MySQL: current database name and version
+  banner, read live rather than hardcoded. pdb_name is NULL -- pluggable
+  databases are an Oracle concept with no MySQL equivalent. No parameters.
+statement: |
+  SELECT
+    DATABASE() AS db_name,
+    NULL AS pdb_name,
+    VERSION() AS version_short,
+    CONCAT('MySQL ', VERSION()) AS version_banner
+---
+kind: toolset
+name: mysql_reads
+tools:
+  - mysql_poll_telemetry
+  - mysql_describe_database
+  - mysql_describe_state
+  - mysql_find_blocking_session
+  - mysql_find_runaway_query
+---
+kind: tool
+name: mysql_describe_state
+type: mysql-sql
+source: mysql-db
+description: >
+  Act-stage pre-action snapshot (Risk 1) for MySQL: same blocked-session
+  count as mysql_poll_telemetry, taken immediately before a remediation
+  statement runs, so every action_executed audit entry carries a pre-state
+  snapshot. No parameters.
+statement: |
+  SELECT COUNT(DISTINCT REQUESTING_THREAD_ID) AS active_blocked_sessions_snapshot
+  FROM performance_schema.data_lock_waits
+---
+kind: tool
+name: mysql_find_blocking_session
+type: mysql-sql
+source: mysql-db
+description: >
+  Sense/Reason-stage lookup: the real PROCESSLIST_ID of the connection
+  currently holding an InnoDB row lock that's blocking another session --
+  grounds mysql_kill_blocking_session's required processlist_id param in a
+  real fact instead of leaving the model to guess it. No parameters.
+statement: |
+  SELECT t.PROCESSLIST_ID AS blocking_processlist_id
+  FROM performance_schema.data_lock_waits w
+  JOIN performance_schema.threads t ON t.THREAD_ID = w.BLOCKING_THREAD_ID
+  LIMIT 1
+---
+kind: tool
+name: mysql_find_runaway_query
+type: mysql-sql
+source: mysql-db
+description: >
+  Sense/Reason-stage lookup: the real PROCESSLIST_ID of the longest-running
+  active client query -- grounds mysql_kill_runaway_query's required
+  processlist_id param in a real fact instead of leaving the model to guess
+  it. MySQL analog of mysql_find_blocking_session, see that tool's
+  description for the anti-hallucination rationale. No parameters.
+statement: |
+  SELECT ID AS runaway_processlist_id
+  FROM information_schema.processlist
+  WHERE COMMAND = 'Query' AND ID <> CONNECTION_ID()
+  ORDER BY TIME DESC
+  LIMIT 1
+---
+# --- MySQL remediation tools (Reason+Act stage -- LLM-callable, one per
+#     config.ALLOWLIST entry with engine="mysql", guarded by
+#     guardrail_callbacks.py exactly like Oracle/AlloyDB. Tier 1 actions
+#     are a plain KILL <processlist_id> (same templateParameters reasoning
+#     as Oracle's ALTER SYSTEM -- KILL doesn't accept a normal bind
+#     variable either). Tier 2/3 terminate MORE THAN ONE connection per
+#     action, and MySQL's KILL has no subquery/WHERE-clause form the way
+#     pg_terminate_backend(pid) FROM ... does -- so those two call a
+#     stored procedure (sp_mysql_terminate_idle_in_transaction /
+#     sp_mysql_reset_all_connections, see mysql_procedures.sql) that
+#     loops a cursor and KILLs each match. ---
+kind: tool
+name: mysql_kill_blocking_session
+type: mysql-sql
+source: mysql-db
+description: >
+  Tier 1 (auto-executes). Terminate a single MySQL connection holding a
+  blocking InnoDB row lock, releasing it. Use when active_blocked_sessions
+  is sustained_high and the nearest runbook points at lock contention.
+  MySQL analog of kill_blocking_session / alloydb_kill_blocking_session.
+templateParameters:
+  - name: processlist_id
+    type: integer
+    description: The blocking connection's PROCESSLIST_ID (information_schema.processlist.ID).
+statement: |
+  KILL {{.processlist_id}}
+---
+kind: tool
+name: mysql_kill_runaway_query
+type: mysql-sql
+source: mysql-db
+description: >
+  Tier 1 (auto-executes). Terminate a single runaway/long-running query's
+  connection. Same mechanism as mysql_kill_blocking_session, kept as a
+  distinct allowlisted action so the audit trail records the operator's
+  actual diagnosis, not just the SQL that ran. MySQL analog of
+  kill_runaway_query / alloydb_kill_runaway_query.
+templateParameters:
+  - name: processlist_id
+    type: integer
+    description: The runaway query's PROCESSLIST_ID (information_schema.processlist.ID).
+statement: |
+  KILL {{.processlist_id}}
+---
+kind: tool
+name: mysql_terminate_idle_in_transaction
+type: mysql-sql
+source: mysql-db
+description: >
+  Tier 2 (auto-executes, logged loudly + paged). Batch-terminate every
+  connection stuck idle-in-transaction longer than idle_seconds, via
+  sp_mysql_terminate_idle_in_transaction (see mysql_procedures.sql) --
+  MySQL analog of alloydb_terminate_idle_in_transaction. Broader blast
+  radius than a single kill, which is why this is Tier 2 rather than
+  Tier 1.
+templateParameters:
+  - name: idle_seconds
+    type: integer
+    description: Terminate connections idle-in-transaction longer than this many seconds.
+statement: |
+  CALL sp_mysql_terminate_idle_in_transaction({{.idle_seconds}})
+---
+kind: tool
+name: mysql_reset_all_connections
+type: mysql-sql
+source: mysql-db
+description: >
+  Tier 3 (requires human approval -- instance-wide change). Terminate
+  every other active connection on this instance via
+  sp_mysql_reset_all_connections (see mysql_procedures.sql): a last-resort
+  connection-pool reset. MySQL analog of alloydb_reset_all_connections.
+  No parameters.
+statement: |
+  CALL sp_mysql_reset_all_connections()
+---
+kind: toolset
+name: mysql_remediation
+tools:
+  - mysql_kill_blocking_session
+  - mysql_kill_runaway_query
+  - mysql_terminate_idle_in_transaction
+  - mysql_reset_all_connections
+---
+kind: toolset
+name: mysql_ops
+tools:
+  - mysql_poll_telemetry
+  - mysql_describe_database
+  - mysql_describe_state
+  - mysql_find_blocking_session
+  - mysql_kill_blocking_session
+  - mysql_kill_runaway_query
+  - mysql_terminate_idle_in_transaction
+  - mysql_reset_all_connections

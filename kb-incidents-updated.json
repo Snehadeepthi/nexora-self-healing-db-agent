@@ -1,0 +1,102 @@
+{
+  "store": "NEXORA Knowledge Base -- incident postmortems",
+  "description": "Real incidents hit and resolved building and operating the Self-Healing DB Agent. Kept as a living postmortem log, separate from runbooks.json (what the agent itself consults mid-incident).",
+  "incidents": [
+    {
+      "id": "kb-01",
+      "tier": "Tier 1",
+      "title": "Oracle unreachable after every VM reboot (V$ grants wiped)",
+      "problem_statement": "/tick returns {\"outcome\":\"oracle_unreachable\",\"detail\":\"Expecting value: line 1 column 1 (char 0)\"} immediately after the Oracle VM starts or restarts.",
+      "root_cause": "The oracle-xe container is declared via gce-container-declaration with no persistent data volume, so every VM boot reinitializes Oracle as a brand-new database from scratch -- wiping the V$SESSION / V$SYSMETRIC / ALTER SYSTEM grants executor_sa needs. Toolbox returns the resulting ORA-00942 as a plain-text error body, which the client fails to JSON-parse, surfacing as the generic-looking 'Expecting value' message.",
+      "solution_steps": [
+        "SSH into the Oracle VM and locate the running container: docker ps --filter name=klt-oracle-xe.",
+        "Run the grant script as SYS: ALTER SESSION SET CONTAINER=XEPDB1; GRANT SELECT ON V_$SESSION, V_$SYSMETRIC, V_$INSTANCE, V_$VERSION TO executor_sa; GRANT ALTER SYSTEM TO executor_sa;",
+        "Confirmed durable fix: the VM startup script re-applies this automatically on every boot (idempotent), retrying the real grant command itself until its own output is clean of ORA-/SP2- errors."
+      ]
+    },
+    {
+      "id": "kb-02",
+      "tier": "Tier 1",
+      "title": "Grant script fails: \"No such container: oracle-xe\"",
+      "problem_statement": "The automatic (or manual) grant-reapplication script errors with Error response from daemon: No such container: oracle-xe.",
+      "root_cause": "GCE's Konlet mechanism, which launches containers from a gce-container-declaration block, does not name the real Docker container after the spec's name: field -- the actual name is klt-<name>-<random 4-char suffix>, regenerated fresh on every boot.",
+      "solution_steps": [
+        "Never hardcode the container name.",
+        "Look it up dynamically at runtime: ORACLE_CONTAINER=$(docker ps --filter \"name=klt-oracle-xe\" --format \"{{.Names}}\" | head -n1).",
+        "Use $ORACLE_CONTAINER in every subsequent docker exec."
+      ]
+    },
+    {
+      "id": "kb-03",
+      "tier": "Tier 1",
+      "title": "Intermittent ORA-12514 during the grant fix",
+      "problem_statement": "The grant script occasionally fails with ORA-12514: TNS:listener does not currently know of service requested in connect descriptor, even though Oracle is clearly up.",
+      "root_cause": "A probe-then-real-command pattern (test connectivity with a disposable connection, then run the real SYS grant as a separate step) raced Oracle's own PDB service registration with the listener: the probe caught a brief window where XEPDB1 was reachable, then the real command ran moments later against a listener that had not finished registering the PDB service yet.",
+      "solution_steps": [
+        "Do not use a separate readiness probe.",
+        "Retry the REAL target command itself in a loop, checking its own output for ORA-/SP2- error codes (sqlplus can exit 0 even when individual statements failed).",
+        "Back off ~10s between attempts; first-boot registration lag was observed up to a few minutes on e2-medium."
+      ]
+    },
+    {
+      "id": "kb-04",
+      "tier": "Tier 3",
+      "title": "Agent detects real incidents but always returns no_action_proposed",
+      "problem_statement": "Sense and Predict correctly detect a confirmed anomaly (e.g. active_blocked_sessions >= 8, sustained), but the Reason stage always ends in {\"outcome\":\"no_action_proposed\"} -- the model never calls any tool, with no guardrail or audit trail explaining why.",
+      "root_cause": "The ADK agent's McpToolset (the LLM's only path to its remediation tools) was connecting to the bare Toolbox base URL with no path, while Toolbox's actual MCP endpoint lives at /mcp/. Every session-creation attempt failed with a flat 405 Method Not Allowed, silently leaving the agent with zero tools -- invisible from the API response, only visible in raw Cloud Run application logs.",
+      "solution_steps": [
+        "Point the MCP connection at {TOOLBOX_URL}/mcp/, not the bare base URL.",
+        "To catch this class of bug earlier: exercise the real Sense->Predict->Reason->Act path at least once per deploy, not just the guardrail-gate demo shortcuts (which bypass the LLM agent entirely).",
+        "When outcomes look suspiciously silent, pull raw textPayload logs (gcloud logging read ... AND textPayload:*) rather than trusting the BigQuery audit trail alone -- some failure paths never write an audit row."
+      ]
+    },
+    {
+      "id": "kb-05",
+      "tier": "Ops",
+      "title": "GRANT silently mangled: \"V_$SESSION\" became \"V_\"",
+      "problem_statement": "A grant statement appears to run without error, but the privilege never actually applies -- the executed SQL was silently GRANT SELECT ON V_ TO executor_sa.",
+      "root_cause": "Single quotes cannot nest in bash. Inlining a quoted heredoc (<< 'SQL' ... SQL) inside an already single-quoted sudo bash -c '...' wrapper breaks the outer quoting, so $SESSION gets expanded as an (unset, empty) shell variable instead of staying literal.",
+      "solution_steps": [
+        "Never inline a quoted heredoc inside a single-quoted sudo bash -c wrapper.",
+        "Write the SQL to a real file first, then reference it with plain file redirection: sqlplus ... < grant_v_views.sql.",
+        "When in doubt, cat the file back out immediately after writing it, and diff against the intended content before running it."
+      ]
+    },
+    {
+      "id": "kb-06",
+      "tier": "Ops",
+      "title": "sqlplus one-liner fails: ORA-00933 / SP2-0306",
+      "problem_statement": "A quick diagnostic query piped in as echo \"SELECT ...; EXIT;\" | sqlplus fails with ORA-00933: SQL command not properly ended.",
+      "root_cause": "A single-line echo with two statements separated only by \"; \" does not reliably split into separate lines the way sqlplus expects -- it can be read as one malformed statement.",
+      "solution_steps": [
+        "Use printf with explicit \\n newlines instead of a single-line echo.",
+        "For anything longer than 1-2 statements, prefer a heredoc or a real .sql file over piped echo/printf entirely."
+      ]
+    },
+    {
+      "id": "kb-07",
+      "tier": "Ops",
+      "title": "Uploaded script fails with $'\\r': command not found",
+      "problem_statement": "A shell script that worked when pasted directly fails after being downloaded and re-uploaded, with errors like invalid option and $'\\r': command not found on nearly every line.",
+      "root_cause": "The file picked up Windows-style CRLF (\\r\\n) line endings somewhere in a download/upload round-trip -- bash only expects LF (\\n) and treats the stray \\r as part of the command.",
+      "solution_steps": [
+        "Strip the stray carriage returns before running: sed -i 's/\\r$//' script.sh.",
+        "Re-run chmod +x if needed, then execute normally.",
+        "Prefer pasting directly into Cloud Shell's built-in code editor over a download/upload round-trip when line-ending corruption is a risk."
+      ]
+    },
+    {
+      "id": "kb-08",
+      "tier": "Tier 1",
+      "title": "AlloyDB tools return \"Tool ... not found\" even after AlloyDB is READY",
+      "problem_statement": "/database/info?db=alloydb and any alloydb_* tool call return {\"error\":\"Tool 'alloydb_describe_database' not found.\"}, persisting even after the AlloyDB instance reaches READY state (confirmed not a startup-timing issue).",
+      "root_cause": "database.tf's metadata_startup_script bakes tools_db/tools.yaml into the Oracle VM via Terraform's file() interpolation and rewrites it on every boot, but its sed substitution block only resolves ${ORACLE_*} placeholders -- it never adds the five ${ALLOYDB_HOST}/${ALLOYDB_PORT}/${ALLOYDB_DATABASE}/${ALLOYDB_USER}/${ALLOYDB_PASSWORD} lines. Toolbox loads the file with those placeholders still literal, so the alloydb-db source block (and every tool depending on it, including alloydb_describe_database) silently fails to register -- Oracle tools load fine, masking the gap.",
+      "solution_steps": [
+        "Confirm it is not a timing issue: check gcloud alloydb instances list shows STATUS=READY, then re-curl -- if the error persists, it is the sed gap, not startup lag.",
+        "Temporary fix (safe, no Terraform apply): build a fully-resolved tools.yaml locally with BOTH Oracle and AlloyDB placeholders substituted, gcloud compute scp it to the VM, then docker restart toolbox -- confirm via logs it reports the full tool count (e.g. 'Initialized 19 tools') including alloydb_describe_database.",
+        "This temporary fix lives only on the VM disk and silently reverts on the next Oracle VM stop/start or reboot, since the startup script unconditionally overwrites tools.yaml from stale Terraform-baked metadata every boot -- re-apply after every restart until the permanent fix ships.",
+        "Permanent fix: add the 5 missing ${ALLOYDB_*} sed -e lines to database.tf's metadata_startup_script and apply deliberately with a VM snapshot first -- changing metadata_startup_script forces full VM replacement, so this must never go through a rushed terraform apply."
+      ]
+    }
+  ]
+}

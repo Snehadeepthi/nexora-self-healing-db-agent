@@ -1,0 +1,7 @@
+google-adk>=2.7.0
+mcp>=1.24,<2
+toolbox-core
+flask
+gunicorn
+oracledb
+google-auth

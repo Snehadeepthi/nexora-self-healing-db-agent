@@ -1,0 +1,16 @@
+nexora_venv/
+__pycache__/
+*.pyc
+*.bak.*
+.terraform/
+*.tfstate
+*.tfstate.backup
+.env
+*credential*
+*.log
+terraform.tfvars
+tfplan*
+*.bak
+*.pre-registry.bak
+tools_cloudrun.resolved.yaml
+live_tools.yaml

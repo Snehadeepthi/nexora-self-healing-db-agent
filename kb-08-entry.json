@@ -1,0 +1,13 @@
+{
+  "id": "kb-08",
+  "tier": "Tier 1",
+  "title": "AlloyDB tools return \"Tool ... not found\" even after AlloyDB is READY",
+  "problem_statement": "/database/info?db=alloydb and any alloydb_* tool call return {\"error\":\"Tool 'alloydb_describe_database' not found.\"}, persisting even after the AlloyDB instance reaches READY state (confirmed not a startup-timing issue).",
+  "root_cause": "database.tf's metadata_startup_script bakes tools_db/tools.yaml into the Oracle VM via Terraform's file() interpolation and rewrites it on every boot, but its sed substitution block only resolves ${ORACLE_*} placeholders -- it never adds the five ${ALLOYDB_HOST}/${ALLOYDB_PORT}/${ALLOYDB_DATABASE}/${ALLOYDB_USER}/${ALLOYDB_PASSWORD} lines. Toolbox loads the file with those placeholders still literal, so the alloydb-db source block (and every tool depending on it, including alloydb_describe_database) silently fails to register -- Oracle tools load fine, masking the gap.",
+  "solution_steps": [
+    "Confirm it is not a timing issue: check gcloud alloydb instances list shows STATUS=READY, then re-curl -- if the error persists, it is the sed gap, not startup lag.",
+    "Temporary fix (safe, no Terraform apply): build a fully-resolved tools.yaml locally with BOTH Oracle and AlloyDB placeholders substituted, gcloud compute scp it to the VM, then docker restart toolbox -- confirm via logs it reports the full tool count (e.g. 'Initialized 19 tools') including alloydb_describe_database.",
+    "This temporary fix lives only on the VM disk and silently reverts on the next Oracle VM stop/start or reboot, since the startup script unconditionally overwrites tools.yaml from stale Terraform-baked metadata every boot -- re-apply after every restart until the permanent fix ships.",
+    "Permanent fix: add the 5 missing ${ALLOYDB_*} sed -e lines to database.tf's metadata_startup_script and apply deliberately with a VM snapshot first -- changing metadata_startup_script forces full VM replacement, so this must never go through a rushed terraform apply."
+  ]
+}

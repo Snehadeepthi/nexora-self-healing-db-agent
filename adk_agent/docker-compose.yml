@@ -1,0 +1,44 @@
+# Local dev/demo harness: a real Oracle XE instance (same image
+# terraform/database.tf uses in GCP) + a real MCP Toolbox for Databases
+# server pointed at tools_db/tools.yaml. This is what agent.py/pipeline.py
+# talk to when TOOLBOX_URL points at http://localhost:5000 (the default --
+# see db_tools.py). Nothing here is a simulator; it's the same shape as the
+# GCP deployment, just running on your machine.
+#
+# Usage:
+#   ORACLE_PASSWORD=SomeRealPassword123! docker compose up -d
+#   # wait ~60-90s for Oracle XE's first boot (creates the pluggable DB)
+#   python seed/simulate_blocking.py open 9   # trigger a real Tier 1 incident
+#   python main.py                            # or demo.py, pointed at localhost
+
+services:
+  oracle-db:
+    image: gvenzl/oracle-xe:21-slim
+    environment:
+      ORACLE_PASSWORD: ${ORACLE_PASSWORD:?set ORACLE_PASSWORD before starting}
+      APP_USER: executor_sa
+      APP_USER_PASSWORD: ${ORACLE_PASSWORD:?set ORACLE_PASSWORD before starting}
+    ports:
+      - "1521:1521"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 18   # first boot (DB creation) can take well over a minute
+
+  toolbox:
+    image: us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:latest
+    depends_on:
+      oracle-db:
+        condition: service_healthy
+    environment:
+      ORACLE_HOST: oracle-db
+      ORACLE_PORT: "1521"
+      ORACLE_SERVICE: XEPDB1
+      ORACLE_USER: executor_sa
+      ORACLE_PASSWORD: ${ORACLE_PASSWORD:?set ORACLE_PASSWORD before starting}
+    volumes:
+      - ./tools_db/tools.yaml:/app/tools.yaml:ro
+    command: ["--config=/app/tools.yaml", "--address=0.0.0.0", "--port=5000"]
+    ports:
+      - "5000:5000"

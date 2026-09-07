@@ -1,0 +1,22 @@
+{
+  "store": "NEXORA Runbook Storage",
+  "description": "The runbooks gcp_runbooks.BigQueryRunbookStore seeds and retrieves via nearest() (bag-of-words cosine match against the Predict-stage event's query_text) to ground the Reason-stage LLM call. This is what the agent itself consults mid-incident -- separate from kb-incidents.json (postmortems on building/operating the system).",
+  "runbooks": [
+    {
+      "id": "rb-01",
+      "title": "Sustained blocked sessions",
+      "tier": "Tier 1",
+      "action_key": "kill_blocking_session",
+      "match_key": "active_blocked_sessions sustained_high unconfirmed",
+      "body": "active_blocked_sessions has stayed at or above the anomaly threshold for CONSECUTIVE_ANOMALY_THRESHOLD consecutive ticks. Identify the session currently holding the lock via v$session.blocking_session, then terminate exactly that session -- ALTER SYSTEM KILL SESSION 'sid,serial#' IMMEDIATE -- to release every session waiting behind it."
+    },
+    {
+      "id": "rb-02",
+      "title": "Library cache contention",
+      "tier": "Tier 2",
+      "action_key": "flush_shared_pool",
+      "match_key": "library cache contention shared pool fragmentation high parse",
+      "body": "High hard-parse rates and library cache contention driven by shared pool fragmentation. Flush the shared pool -- ALTER SYSTEM FLUSH SHARED_POOL -- to clear fragmented and stale cursors and relieve contention. Auto-executes at Tier 2: allowed without human approval, but every run is logged loudly to the audit trail."
+    }
+  ]
+}
