@@ -151,6 +151,11 @@ observable fix — not just a documentation update:
 - Dashboard Cost-Avoided ROI panel
 - (baseline) Hallucination firewall + allowlist governor with signed actions
 
+Each of these maps to a general principle for running autonomous agents
+against production infrastructure, not just a hackathon-specific bug fix —
+see **[`ENTERPRISE.md`](ENTERPRISE.md)** for the full reframe, plus the case
+for MCP over a direct database connection.
+
 ## Repository layout
 
 This repo holds two runnable versions of NEXORA:
